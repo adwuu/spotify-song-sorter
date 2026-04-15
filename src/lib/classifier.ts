@@ -52,7 +52,9 @@ export type ClassifyInput = {
   playlists: PlaylistInput[];
   /** Full lookup map by spotify track ID (union of liked + playlist tracks) */
   tracksById: Map<string, TrackInput>;
-  /** Genre lookup: artist ID → list of genre tags */
+  /** Primary: track-level genre tags from Last.fm, keyed by track ID */
+  tagsByTrackId: Map<string, string[]>;
+  /** Fallback: artist-level genres from Spotify, keyed by artist ID */
   genresByArtistId: Map<string, string[]>;
 };
 
@@ -103,13 +105,18 @@ type Vec = Float64Array;
 const AUDIO_DIMS = 8;
 
 /**
- * Build the global genre vocabulary across every artist we've seen.
- * Each unique genre tag gets a stable index in the returned array.
+ * Build the global genre vocabulary from both track-level tags (Last.fm)
+ * and artist-level genres (Spotify fallback). Each unique tag gets a
+ * stable index in the returned array.
  */
 function buildGenreVocabulary(
+  tagsByTrackId: Map<string, string[]>,
   genresByArtistId: Map<string, string[]>,
 ): string[] {
   const set = new Set<string>();
+  for (const tags of tagsByTrackId.values()) {
+    for (const t of tags) set.add(t);
+  }
   for (const genres of genresByArtistId.values()) {
     for (const g of genres) set.add(g);
   }
@@ -125,9 +132,14 @@ function buildGenreVocabulary(
  *
  * Each genre dimension is multiplied by (GENRE_WEIGHT / sqrt(G)) so the
  * genre block's L2 norm contribution matches the audio block in aggregate.
+ *
+ * Genre source priority:
+ *   1. Track-level tags from Last.fm (tagsByTrackId)
+ *   2. Artist-level genres from Spotify (genresByArtistId) — fallback
  */
 function buildVector(
   track: TrackInput,
+  tagsByTrackId: Map<string, string[]>,
   genresByArtistId: Map<string, string[]>,
   genreVocab: string[],
   genreIndex: Map<string, number>,
@@ -154,18 +166,30 @@ function buildVector(
   // If features are null, leave the audio block as zeros — the math
   // still works, it just contributes nothing to similarity.
 
-  // Genre block (one-hot for any genre ANY of the track's artists have).
+  // Genre block: prefer track-level Last.fm tags, fall back to artist genres.
   if (G > 0) {
     const w = GENRE_WEIGHT / Math.sqrt(G);
     const seen = new Set<number>();
-    for (const aid of track.artistIds) {
-      const genres = genresByArtistId.get(aid);
-      if (!genres) continue;
-      for (const g of genres) {
-        const idx = genreIndex.get(g);
+
+    const trackTags = tagsByTrackId.get(track.id);
+    if (trackTags && trackTags.length > 0) {
+      // Primary: track-level tags from Last.fm
+      for (const tag of trackTags) {
+        const idx = genreIndex.get(tag);
         if (idx !== undefined) seen.add(idx);
       }
+    } else {
+      // Fallback: artist-level genres from Spotify
+      for (const aid of track.artistIds) {
+        const genres = genresByArtistId.get(aid);
+        if (!genres) continue;
+        for (const g of genres) {
+          const idx = genreIndex.get(g);
+          if (idx !== undefined) seen.add(idx);
+        }
+      }
     }
+
     for (const idx of seen) v[AUDIO_DIMS + idx] = w;
   }
 
@@ -254,6 +278,7 @@ export function classify(input: ClassifyInput): ClassifyResult {
     likedSongs,
     playlists,
     tracksById,
+    tagsByTrackId,
     genresByArtistId,
   } = input;
 
@@ -281,15 +306,15 @@ export function classify(input: ClassifyInput): ClassifyResult {
     for (const id of p.trackIds) alreadyPlaced.add(id);
   }
 
-  // Build genre vocabulary from every known artist.
-  const genreVocab = buildGenreVocabulary(genresByArtistId);
+  // Build genre vocabulary from both track tags and artist genres.
+  const genreVocab = buildGenreVocabulary(tagsByTrackId, genresByArtistId);
   const genreIndex = new Map<string, number>();
   genreVocab.forEach((g, i) => genreIndex.set(g, i));
 
   // Build vectors for every unique track we know about.
   const vectors = new Map<string, Vec>();
   for (const [id, t] of tracksById) {
-    vectors.set(id, buildVector(t, genresByArtistId, genreVocab, genreIndex));
+    vectors.set(id, buildVector(t, tagsByTrackId, genresByArtistId, genreVocab, genreIndex));
   }
 
   // Build centroids for each eligible playlist.
@@ -428,4 +453,4 @@ export const _internal = {
   mean,
   norm,
   cosineWithPrecomputedBNorm,
-};
+} as const;

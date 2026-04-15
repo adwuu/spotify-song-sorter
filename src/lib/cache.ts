@@ -58,6 +58,7 @@ function getRedis(): Redis | null {
  */
 const memFeatures = new Map<string, FeaturesValue>();
 const memGenres = new Map<string, string[]>();
+const memTrackTags = new Map<string, string[]>();
 
 export type AudioFeatures = {
   energy: number;
@@ -81,6 +82,7 @@ export function isTombstone(
 
 const FEATURES_PREFIX = "features:";
 const GENRES_PREFIX = "genres:";
+const TRACK_TAGS_PREFIX = "tags:";
 
 /**
  * Batch read audio features. Returns an array parallel to input IDs.
@@ -230,6 +232,82 @@ export async function msetGenres(
   } catch (err) {
     console.warn(
       "[cache] msetGenres failed, continuing without cache:",
+      (err as Error).message,
+    );
+  }
+}
+
+// ───────────────────── track-level tags (Last.fm) ─────────────────────
+
+/**
+ * Batch read track-level genre tags. Returns array parallel to input IDs.
+ * Missing entries are `null`. Empty array `[]` is a tombstone (looked up,
+ * no usable tags found).
+ */
+export async function mgetTrackTags(
+  spotifyTrackIds: string[],
+): Promise<Array<string[] | null>> {
+  if (spotifyTrackIds.length === 0) return [];
+
+  const out: Array<string[] | null> = spotifyTrackIds.map(
+    (id) => memTrackTags.get(id) ?? null,
+  );
+  const missingIdx: number[] = [];
+  for (let i = 0; i < spotifyTrackIds.length; i++) {
+    if (out[i] == null) missingIdx.push(i);
+  }
+  if (missingIdx.length === 0) return out;
+
+  const r = getRedis();
+  if (!r) return out;
+
+  try {
+    const keys = missingIdx.map(
+      (i) => `${TRACK_TAGS_PREFIX}${spotifyTrackIds[i]}`,
+    );
+    const results = await r.mget<Array<string[] | null>>(...keys);
+    for (let j = 0; j < missingIdx.length; j++) {
+      const v = results[j];
+      if (v != null) {
+        out[missingIdx[j]] = v;
+        memTrackTags.set(spotifyTrackIds[missingIdx[j]], v);
+      }
+    }
+  } catch (err) {
+    console.warn(
+      "[cache] mgetTrackTags failed, treating Upstash misses as null:",
+      (err as Error).message,
+    );
+  }
+
+  return out;
+}
+
+/**
+ * Batch write track-level genre tags. Empty array `[]` is a valid
+ * tombstone (means "no usable tags"). Errors logged, not thrown.
+ */
+export async function msetTrackTags(
+  entries: Array<{ spotifyTrackId: string; tags: string[] }>,
+): Promise<void> {
+  if (entries.length === 0) return;
+
+  for (const { spotifyTrackId, tags } of entries) {
+    memTrackTags.set(spotifyTrackId, tags);
+  }
+
+  const r = getRedis();
+  if (!r) return;
+
+  try {
+    const obj: Record<string, string[]> = {};
+    for (const { spotifyTrackId, tags } of entries) {
+      obj[`${TRACK_TAGS_PREFIX}${spotifyTrackId}`] = tags;
+    }
+    await r.mset(obj);
+  } catch (err) {
+    console.warn(
+      "[cache] msetTrackTags failed, continuing without cache:",
       (err as Error).message,
     );
   }

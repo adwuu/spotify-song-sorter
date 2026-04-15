@@ -19,8 +19,7 @@ export default function Home() {
                 Spotify Sorter
               </h1>
               <p className="mt-4 text-sm text-spotify-subtext">
-                Auto-sort your Liked Songs into your custom playlists using
-                audio features
+                Auto-sort your songs into your custom playlists using audio features
               </p>
             </div>
           </div>

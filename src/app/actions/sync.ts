@@ -27,10 +27,13 @@ import {
   msetFeatures,
   mgetGenres,
   msetGenres,
+  mgetTrackTags,
+  msetTrackTags,
   isTombstone,
   type AudioFeatures,
 } from "@/lib/cache";
 import { hydrateFeatures, getRateLimitWaitMs } from "@/lib/reccobeats";
+import { fetchTrackTags } from "@/lib/lastfm";
 import {
   classify,
   type TrackInput,
@@ -133,6 +136,7 @@ export type HydrateStats = {
   cachedTracks: number;
   totalArtists: number;
   cachedArtists: number;
+  cachedTrackTags: number;
 };
 
 export type HydrateResult = {
@@ -282,7 +286,7 @@ export async function hydrateAction(config: SyncConfig): Promise<HydrateResult> 
     if (featuresCache[i] == null) featureMisses.push(trackIdList[i]);
   }
 
-  // 4. Cache check — genres.
+  // 4. Cache check — artist genres (Spotify fallback).
   const artistIdList = Array.from(allArtistIds);
   const genresCache = await mgetGenres(artistIdList);
   const genreMisses: string[] = [];
@@ -290,19 +294,27 @@ export async function hydrateAction(config: SyncConfig): Promise<HydrateResult> 
     if (genresCache[i] == null) genreMisses.push(artistIdList[i]);
   }
 
+  // 4b. Cache check — track-level tags (Last.fm).
+  const trackTagsCache = await mgetTrackTags(trackIdList);
+  const trackTagMisses: string[] = [];
+  for (let i = 0; i < trackIdList.length; i++) {
+    if (trackTagsCache[i] == null) trackTagMisses.push(trackIdList[i]);
+  }
+
   const stats: HydrateStats = {
     totalTracks: trackIdList.length,
     cachedTracks: trackIdList.length - featureMisses.length,
     totalArtists: artistIdList.length,
     cachedArtists: artistIdList.length - genreMisses.length,
+    cachedTrackTags: trackIdList.length - trackTagMisses.length,
   };
 
   console.log(
     `[hydrate] cache status: ${trackIdList.length - featureMisses.length} cached, ${featureMisses.length} misses out of ${trackIdList.length} total`,
   );
 
-  // Early exit: nothing to hydrate (genres are best-effort so not blocking).
-  if (featureMisses.length === 0) {
+  // Early exit: nothing to hydrate — but only if track tags are also done.
+  if (featureMisses.length === 0 && trackTagMisses.length === 0) {
     return {
       done: true,
       progress: { hydrated: stats.cachedTracks, total: stats.totalTracks },
@@ -369,16 +381,58 @@ export async function hydrateAction(config: SyncConfig): Promise<HydrateResult> 
     chunksProcessed++;
   }
 
-  // 6. Hydrate genres (best-effort — does NOT block done status).
-  //    Spotify's per-app rate limit is very tight on new dev-mode apps.
-  //    After fetching 2000+ playlist track pages, the artist calls almost
-  //    always hit the wall. We try a small batch; whatever we get is cached
-  //    in memory for the classify step. On subsequent syncs the rate limit
-  //    resets and more genres fill in.
+  // 6. Hydrate Last.fm track-level tags (best-effort, non-blocking).
+  //    Last.fm allows 5 req/sec. fetchTrackTags handles rate limiting
+  //    internally — pass all misses and let it process as many as possible.
+  //    ~2000 tracks ≈ 400s at 5/sec; stops gracefully on 429.
+  if (Date.now() - started < HYDRATE_TIME_BUDGET_MS && trackTagMisses.length > 0) {
+    // Filter out tracks with empty artist/track names — Last.fm will 400.
+    // Tombstone them immediately so they don't retry forever.
+    const tombstoneEntries: Array<{ spotifyTrackId: string; tags: string[] }> = [];
+    const tagBatch: Array<{ spotifyTrackId: string; artistName: string; trackName: string }> = [];
+
+    for (const tid of trackTagMisses) {
+      const track = allTracks.get(tid)!;
+      const artistName = track.artists[0]?.name ?? "";
+      const trackName = track.name ?? "";
+      if (!artistName || !trackName) {
+        tombstoneEntries.push({ spotifyTrackId: tid, tags: [] });
+      } else {
+        tagBatch.push({ spotifyTrackId: track.id, artistName, trackName });
+      }
+    }
+
+    if (tombstoneEntries.length > 0) {
+      await msetTrackTags(tombstoneEntries);
+    }
+
+    if (tagBatch.length > 0) {
+      try {
+        const results = await fetchTrackTags(tagBatch);
+        const writeEntries: Array<{ spotifyTrackId: string; tags: string[] }> = [];
+        for (const [trackId, result] of results) {
+          if (result.ok) {
+            writeEntries.push({ spotifyTrackId: trackId, tags: result.tags });
+          } else if (result.reason === "not_found" || result.reason === "error") {
+            // Tombstone both not-found and persistent errors so they don't retry.
+            writeEntries.push({ spotifyTrackId: trackId, tags: [] });
+          }
+          // Only "rate_limited" is left uncached for retry next cycle.
+        }
+        await msetTrackTags(writeEntries);
+        const withTags = writeEntries.filter((e) => e.tags.length > 0).length;
+        if (withTags > 0) {
+          console.log(`[hydrate] cached Last.fm tags for ${withTags} tracks`);
+        }
+      } catch {
+        // Network error — that's fine, tags are best-effort.
+      }
+    }
+  }
+
+  // 7. Hydrate Spotify artist genres (fallback, best-effort).
+  //    Only attempt a tiny batch (5) per cycle — Spotify rate limits are tight.
   if (Date.now() - started < HYDRATE_TIME_BUDGET_MS && genreMisses.length > 0) {
-    // Only attempt a tiny batch (5) per hydrate cycle. No retries — if
-    // Spotify is rate-limiting, these will all fail fast (~1s total) and
-    // we move on. Each subsequent Sync picks up more as the limit resets.
     const genreBatch = genreMisses.slice(0, 5);
     try {
       const genreApi = await getSpotify();
@@ -390,18 +444,24 @@ export async function hydrateAction(config: SyncConfig): Promise<HydrateResult> 
       await msetGenres(writeEntries);
       const fetched = writeEntries.filter((e) => e.genres.length > 0).length;
       if (fetched > 0) {
-        console.log(`[hydrate] cached genres for ${fetched} artists`);
+        console.log(`[hydrate] cached Spotify genres for ${fetched} artists`);
       }
     } catch {
-      // Rate limited — that's fine, genres are best-effort.
+      // Rate limited — that's fine, genres are best-effort fallback.
     }
   }
 
-  // Recompute feature cache coverage (genres are NOT blocking).
+  // Recompute feature cache coverage (genres/tags are NOT blocking).
   const featuresCache2 = await mgetFeatures(trackIdList);
   const cachedTracksNow = featuresCache2.filter((v) => v != null).length;
 
-  const done = cachedTracksNow === trackIdList.length;
+  // Recompute track tag coverage for stats.
+  const trackTagsCache2 = await mgetTrackTags(trackIdList);
+  const cachedTagsNow = trackTagsCache2.filter((v) => v != null).length;
+
+  const featuresDone = cachedTracksNow === trackIdList.length;
+  const tagsDone = cachedTagsNow === trackIdList.length;
+  const done = featuresDone && tagsDone;
 
   return {
     done,
@@ -411,6 +471,7 @@ export async function hydrateAction(config: SyncConfig): Promise<HydrateResult> 
       cachedTracks: cachedTracksNow,
       totalArtists: artistIdList.length,
       cachedArtists: artistIdList.length - genreMisses.length,
+      cachedTrackTags: cachedTagsNow,
     },
   };
 }
@@ -444,7 +505,7 @@ export async function classifyAction(): Promise<ClassifyResult> {
     }
   }
 
-  // Pull genres from cache.
+  // Pull artist genres from cache (Spotify fallback).
   const allArtistIds = new Set<string>();
   for (const t of allTracks.values()) {
     for (const a of t.artists) allArtistIds.add(a.id);
@@ -455,6 +516,16 @@ export async function classifyAction(): Promise<ClassifyResult> {
   for (let i = 0; i < artistIdList.length; i++) {
     const g = genresCache[i];
     genresByArtistId.set(artistIdList[i], g ?? []);
+  }
+
+  // Pull track-level tags from cache (Last.fm primary).
+  const trackTagsCache = await mgetTrackTags(trackIdList);
+  const tagsByTrackId = new Map<string, string[]>();
+  for (let i = 0; i < trackIdList.length; i++) {
+    const tags = trackTagsCache[i];
+    if (tags && tags.length > 0) {
+      tagsByTrackId.set(trackIdList[i], tags);
+    }
   }
 
   // Convert to classifier inputs.
@@ -481,13 +552,15 @@ export async function classifyAction(): Promise<ClassifyResult> {
     `[classify] ${likedInputs.length} source songs, ` +
     `${playlistInputs.length} playlists, ` +
     `${tracksById.size} unique tracks, ` +
-    `${withFeatures} have audio features (${tracksById.size - withFeatures} missing)`,
+    `${withFeatures} have audio features (${tracksById.size - withFeatures} missing), ` +
+    `${tagsByTrackId.size} have Last.fm tags`,
   );
 
   const result = classify({
     likedSongs: likedInputs,
     playlists: playlistInputs,
     tracksById,
+    tagsByTrackId,
     genresByArtistId,
   });
 

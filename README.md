@@ -9,8 +9,8 @@ Three phases: **hydrate** (fetch tracks + audio features), **classify** (compute
 ## How it works
 
 1. Pick your source playlists (Liked Songs + whatever else) and target playlists
-2. The app fetches every track's audio features (energy, valence, danceability, tempo, etc.) and artist genres
-3. Each target playlist gets a centroid — a mean vector representing its typical sound
+2. The app fetches every track's audio features (energy, valence, danceability, tempo, etc.) and genre tags from Last.fm
+3. Each target playlist gets a centroid — a mean vector representing its typical sound and genre profile
 4. Every unsorted song is scored against each centroid; songs above the similarity threshold get proposed
 5. You review the proposals and hit apply — only then does anything touch your Spotify library
 
@@ -22,7 +22,8 @@ The classifier uses adaptive thresholds: tight playlists (where everything alrea
 - **React 19**, **Tailwind CSS 4**, **TypeScript 5**
 - **Spotify Web API** via `@spotify/web-api-ts-sdk`
 - **ReccoBeats API** for audio features (Spotify deprecated their audio-features endpoint)
-- **Upstash Redis** for caching features and genres across sessions (optional — falls back to in-memory)
+- **Last.fm API** for track-level genre tags (more accurate than Spotify's artist-level genres)
+- **Upstash Redis** for caching features, genres, and tags across sessions (optional — falls back to in-memory)
 - **Vitest** for tests
 
 ## Setup
@@ -62,14 +63,28 @@ npm run dev
 
 Open [localhost:3000](http://localhost:3000).
 
-### Optional: Upstash Redis
+### 4. Last.fm API key (recommended)
 
-Without Redis the app caches audio features in memory, which means progress is lost on server restart. For persistent caching, add:
+Sign up for a free API account at [last.fm/api/account/create](https://www.last.fm/api/account/create). The callback URL doesn't matter — put any placeholder. Add the key to `.env.local`:
+
+```
+LASTFM_API_KEY=...
+```
+
+This gives the classifier track-level genre and vibe tags from Last.fm's community data, which are much more accurate than Spotify's artist-level genres. Without it the app still works — it falls back to Spotify artist genres.
+
+On the first sync, Last.fm tags are fetched at 5 requests/second (~7 minutes for a 2,000-track library). Results are cached permanently so subsequent syncs are instant.
+
+### 5. Upstash Redis (recommended)
+
+Without Redis the app caches audio features, genres, and tags in memory only — progress is lost on server restart. For persistent caching, create a free Redis database at [console.upstash.com](https://console.upstash.com) (free tier: 10k commands/day, 256MB) and add:
 
 ```
 UPSTASH_REDIS_REST_URL=...
 UPSTASH_REDIS_REST_TOKEN=...
 ```
+
+With Upstash configured, the first sync populates the cache and every subsequent sync (even after server restarts or redeployments) is fast — no repeated API calls to ReccoBeats or Last.fm.
 
 ### Optional: basic auth gate
 
@@ -98,4 +113,4 @@ If too many songs end up in the "below threshold" tab, lower the threshold. If s
 
 ## Safety
 
-The app only adds tracks to playlists — it never deletes. Hydrate and classify are entirely read-only. Deduplication prevents adding songs that are already in a target playlist. If Redis is down or unconfigured, everything still works (just slower).
+The app only adds tracks to playlists — it never deletes. Hydrate and classify are entirely read-only. Deduplication prevents adding songs that are already in a target playlist. If Redis is down or unconfigured, everything still works (just slower). If Last.fm is down or the API key is missing, the classifier falls back to Spotify artist-level genres.
