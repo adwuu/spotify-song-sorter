@@ -101,6 +101,23 @@ For production deployments, set `BASIC_AUTH_USER` and `BASIC_AUTH_PASS` to put t
 | `npm run test:watch` | Run tests in watch mode |
 | `npm run setup-token` | OAuth flow to generate a Spotify refresh token |
 
+## Known limitations: genre data coverage
+
+The classifier relies on genre/vibe tags to distinguish playlists that sound similar but belong to different genres (e.g. upbeat K-pop vs upbeat indie pop). In practice, coverage is poor:
+
+- **Spotify artist genres**: the `GET /artists/{id}` endpoint no longer returns the `genres` field for new/dev-mode apps. This fallback is effectively dead.
+- **Last.fm track tags**: only ~18% of tracks get usable tags. Last.fm requires exact artist+title matches, and Spotify track names are full of suffixes ("- Remastered 2024", "(feat. X)", "(Deluxe Edition)") that cause mismatches. Less popular tracks also lack community votes.
+- **ReccoBeats audio features**: ~71% coverage, but the 8 audio dimensions (energy, valence, danceability, etc.) alone can't distinguish genre — only "vibe".
+
+This means **~82% of tracks are classified on audio features alone**, which is too weak for accurate genre-based sorting.
+
+### Potential improvements
+
+1. **Last.fm `artist.getTopTags`** — artist-level tags from Last.fm would cover far more tracks than track-level lookups, since most artists exist on Last.fm even when specific tracks don't. Three-tier fallback: track tags > artist tags > audio features only.
+2. **Track name cleanup** — strip "(feat. ...)", "- Remastered ...", "(Deluxe Edition)" etc. before querying Last.fm to improve match rates.
+3. **MusicBrainz tags** — secondary source for tracks Last.fm doesn't cover.
+4. **Better similarity model** — the current cosine similarity over a flat feature vector may not be the best approach when genre data is sparse.
+
 ## Tuning the classifier
 
 Constants live in `src/lib/classifier.ts`:
